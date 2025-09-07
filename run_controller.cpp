@@ -1,4 +1,8 @@
 #include <iostream>
+#include <atomic>
+#include <thread>
+#include <unistd.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
@@ -34,17 +38,13 @@ static constexpr int CALLBACK_MESSAGE_SKIP = 1; // Can be used to only process e
 static constexpr double OBS_EMA_FILTER_ALPHA = 1.0; // Filter coefficient for ema-filtering the obs
 
 static const int STATE_DIM = 45;
-// order of states for the neural network input
-// NEW: its defined below in statesToTensor, which is more efficient.
-// const std::vector<std::string> STATE_ORDER = {
-//     // "robot/base_lin_vel",
-//     "robot/ang_vel_b",
-//     "robot/command",
-//     "robot/projected_gravity_b",
-//     "robot/joint_pos",
-//     "robot/joint_vel",
-//     "robot/last_action"
-// };
+
+enum class ControllerType : int {
+    DAMPING = 0,
+    STAND_UP = 1,
+    NEURAL_NETWORK = 2,
+    STAND_DOWN = 3,
+};
 
 ////// CONSTANTS
 #define TOPIC_LOWCMD "rt/lowcmd"
@@ -215,7 +215,13 @@ class Custom
 {
 public:
     Custom() {};
-    ~Custom() {};
+    ~Custom() {
+        // Clean shutdown
+        should_exit.store(true);
+        if (input_thread.joinable()) {
+            input_thread.join();
+        }
+    };
     void Init();
     bool LoadNeuralNetwork(const std::string &model_path);
 
@@ -234,6 +240,23 @@ private:
     torch::Tensor reused_state_tensor;
     std::vector<double> reused_state_vector;
     bool tensors_initialized = false;
+
+    // Controller switching variables
+    std::atomic<int> current_controller{static_cast<int>(ControllerType::DAMPING)};
+    std::atomic<bool> should_exit{false};
+
+    // Controller state variables
+    ControllerType active_controller = ControllerType::DAMPING;
+    double controller_switch_time = 0.0;
+    std::array<double, 12> switch_start_positions{};
+    bool position_captured = false;
+
+    // Input thread
+    std::thread input_thread;
+
+    // Controller switching methods
+    void startInputThread();
+    void inputThreadFunction();
 
 private:
     double stand_up_joint_pos[12] = {0.00571868, 0.608813, -1.21763, -0.00571868, 0.608813, -1.21763, 0.00571868, 0.608813, -1.21763, -0.00571868, 0.608813, -1.21763};
@@ -617,6 +640,9 @@ void Custom::Init()
     lowstate_subscriber.reset(new ChannelSubscriber<unitree_go::msg::dds_::LowState_>(TOPIC_LOWSTATE));
     lowstate_subscriber->InitChannel(std::bind(&Custom::LowStateMessageHandler, this, std::placeholders::_1), 1);
 
+    // Start input thread for controller switching
+    startInputThread();
+
     /*loop publishing thread*/
     // lowCmdWriteThreadPtr = CreateRecurrentThreadEx("writebasiccmd", UT_CPU_ID_NONE, int(dt * 1000000), &Custom::LowCmdWrite, this);
 }
@@ -639,76 +665,192 @@ void Custom::InitLowCmd()
     }
 }
 
-void Custom::LowStateMessageHandler(const void *message)
-{
-    auto start = std::chrono::high_resolution_clock::now();
-
+void Custom::LowStateMessageHandler(const void *message) {
     static int msg_loop_counter = 0;
     msg_loop_counter++;
 
-    // Only process every Xth message for debugging
-    if (msg_loop_counter % CALLBACK_MESSAGE_SKIP != 0)
-    {
-        return; // Skip most messages
+    if (msg_loop_counter % CALLBACK_MESSAGE_SKIP != 0) {
+        return;
     }
+
     low_state = *(unitree_go::msg::dds_::LowState_ *)message;
-
-    auto states = Go2LowStateHandler::processLowState(low_state);
-    // Update the last_action in the states map with the previous action
-    states["robot/last_action"] = last_action;
-
-    // Convert states to PyTorch tensor
-    torch::Tensor current_obs = StatesToTensor(states);
-
-    // Run neural network inference if model is loaded
-    if (model_loaded && obs_history_storage)
-    {
-
-        // Add current observation to history buffer
-        obs_history_storage->add(current_obs);
-
-        // Get the full history for neural network input
-        torch::Tensor history_input = obs_history_storage->get();
-
-        // Run neural network inference with history
-
-        std::vector<double> actions = RunInference(history_input);
-        last_action = actions;
-
-        if (!actions.empty())
-        {
-
-            // Reorder using the mapping (convert tensor indices to C++ indexing)
-            std::vector<double> reordered_actions(12);
-            for (int i = 0; i < 12; ++i)
-            {
-                int isaac_lab_idx = JOINT_ISAAC_LAB_TO_UNITREE_MAPPING.data_ptr<int64_t>()[i];
-                reordered_actions[i] = actions[isaac_lab_idx];
-            }
-
-            // Scale and clamp using C++ operations
-            for (double &action : reordered_actions)
-            {
-                action = clamp(action * action_scale, clip_action_min, clip_action_max);
-            }
-
-            // write reordered_actions as torque commands and send to robot
-            for (int i = 0; i < 12; i++)
-            {
+    
+    // Check for controller switch and handle switching
+    int requested_controller = current_controller.load();
+    if (requested_controller != static_cast<int>(active_controller)) {
+        active_controller = static_cast<ControllerType>(requested_controller);
+        controller_switch_time = 0.0;
+        position_captured = false;
+    }
+    
+    // Execute current controller
+    switch(active_controller) {
+        case ControllerType::DAMPING: {
+            // Set position control with damping
+            for (int i = 0; i < 12; i++) {
                 low_cmd.motor_cmd()[i].q() = 0;
-                low_cmd.motor_cmd()[i].kp() = 0;
                 low_cmd.motor_cmd()[i].dq() = 0;
-                low_cmd.motor_cmd()[i].kd() = 0;
-                low_cmd.motor_cmd()[i].tau() = reordered_actions[i];
+                low_cmd.motor_cmd()[i].kp() = 0.0;
+                low_cmd.motor_cmd()[i].kd() = 2.;
+                low_cmd.motor_cmd()[i].tau() = 0;
             }
-
-            cmd_timer.recordCall();
-
-            // Calculate the CRC for the command message and publish it
+            
             low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
             lowcmd_publisher->Write(low_cmd);
+            break;
+        }
+        
+        case ControllerType::STAND_DOWN: {
+            // Capture current position on first call
+            if (!position_captured) {
+                for (int i = 0; i < 12; i++) {
+                    switch_start_positions[i] = low_state.motor_state()[i].q();
+                }
+                position_captured = true;
+            }
+            
+            // Smooth transition to stand up position (1.2 second transition)
+            controller_switch_time += dt;
+            double phase = tanh(controller_switch_time / 1.2);
+            
+            for (int i = 0; i < 12; i++) {
+                double target_pos = phase * stand_down_joint_pos[i] + (1.0 - phase) * switch_start_positions[i];
+                
+                low_cmd.motor_cmd()[i].q() = target_pos;
+                low_cmd.motor_cmd()[i].dq() = 0;
+                low_cmd.motor_cmd()[i].kp() = 50;
+                low_cmd.motor_cmd()[i].kd() = 3.5;
+                low_cmd.motor_cmd()[i].tau() = 0;
+            }
+            
+            low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
+            lowcmd_publisher->Write(low_cmd);
+            break;
+        }
+
+        case ControllerType::STAND_UP: {
+            // Capture current position on first call
+            if (!position_captured) {
+                for (int i = 0; i < 12; i++) {
+                    switch_start_positions[i] = low_state.motor_state()[i].q();
+                }
+                position_captured = true;
+            }
+            
+            // Smooth transition to stand up position (1.2 second transition)
+            controller_switch_time += dt;
+            double phase = tanh(controller_switch_time / 1.2);
+            
+            for (int i = 0; i < 12; i++) {
+                double target_pos = phase * stand_up_joint_pos[i] + (1.0 - phase) * switch_start_positions[i];
+                
+                low_cmd.motor_cmd()[i].q() = target_pos;
+                low_cmd.motor_cmd()[i].dq() = 0;
+                low_cmd.motor_cmd()[i].kp() = phase * 50.0 + (1 - phase) * 25.0;
+                low_cmd.motor_cmd()[i].kd() = 3.5;
+                low_cmd.motor_cmd()[i].tau() = 0;
+            }
+            
+            low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
+            lowcmd_publisher->Write(low_cmd);
+            break;
+        }
+        
+        case ControllerType::NEURAL_NETWORK: {
+
+            // Your existing neural network logic
+            auto states = Go2LowStateHandler::processLowState(low_state);
+            states["robot/last_action"] = last_action;
+            
+            torch::Tensor current_obs = StatesToTensor(states);
+            
+            if (model_loaded && obs_history_storage) {
+                obs_history_storage->add(current_obs);
+                torch::Tensor history_input = obs_history_storage->get();
+                
+                std::vector<double> actions = RunInference(history_input);
+                last_action = actions;
+                
+                if (!actions.empty()) {
+                    std::vector<double> reordered_actions(12);
+                    for (int i = 0; i < 12; ++i) {
+                        int isaac_lab_idx = JOINT_ISAAC_LAB_TO_UNITREE_MAPPING.data_ptr<int64_t>()[i];
+                        reordered_actions[i] = actions[isaac_lab_idx];
+                    }
+                    
+                    for (double &action : reordered_actions) {
+                        action = clamp(action * action_scale, clip_action_min, clip_action_max);
+                    }
+                    
+                    // Torque control mode
+                    for (int i = 0; i < 12; i++) {
+                        low_cmd.motor_cmd()[i].q() = 0;
+                        low_cmd.motor_cmd()[i].kp() = 0;
+                        low_cmd.motor_cmd()[i].dq() = 0;
+                        low_cmd.motor_cmd()[i].kd() = 0;
+                        low_cmd.motor_cmd()[i].tau() = reordered_actions[i];
+                    }
+                    
+                    cmd_timer.recordCall();
+                    
+                    low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
+                    lowcmd_publisher->Write(low_cmd);
+                }
+            }
+            break;
         }
     }
+}
+
+void Custom::startInputThread() {
+    input_thread = std::thread(&Custom::inputThreadFunction, this);
+}
+
+void Custom::inputThreadFunction() {
+    std::cout << "\nController Commands:\n";
+    std::cout << "d - Damping Controller\n";
+    std::cout << "u - Stand Up Controller\n"; 
+    std::cout << "l - Stand Down (Low) Controller\n"; 
+    std::cout << "n - Neural Network Controller\n\n";
+    
+    // Set stdin to non-blocking mode
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    
+    char cmd;
+    while (!should_exit.load()) {
+        // Non-blocking read
+        if (read(STDIN_FILENO, &cmd, 1) > 0) {
+            switch(cmd) {
+                case 'd':
+                case 'D':
+                    current_controller.store(static_cast<int>(ControllerType::DAMPING));
+                    std::cout << "Switched to Damping Controller\n";
+                    break;
+                case 's':
+                case 'S':
+                    current_controller.store(static_cast<int>(ControllerType::STAND_UP));
+                    std::cout << "Switched to Stand Up Controller\n";
+                    break;
+                case 'l':
+                case 'L':
+                    current_controller.store(static_cast<int>(ControllerType::STAND_DOWN));
+                    std::cout << "Switched to Stand Up Controller\n";
+                    break;
+                case 'n':
+                case 'N':
+                    current_controller.store(static_cast<int>(ControllerType::NEURAL_NETWORK));
+                    std::cout << "Switched to Neural Network Controller\n";
+                    break;
+            }
+        }
+        
+        // Sleep for 100ms to reduce CPU usage
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    // Restore stdin to blocking mode
+    fcntl(STDIN_FILENO, F_SETFL, flags);
 }
 
 void Custom::LowCmdWrite()
@@ -770,6 +912,9 @@ int main(int argc, const char **argv)
     std::cin.get();
     Custom custom;
     custom.Init();
+
+    std::cout << "System initialized. Robot controller is running...\n";
+    std::cout << "Starting with Damping Controller (robot will hold current position)\n";
 
     while (1)
     {

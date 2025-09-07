@@ -991,8 +991,6 @@ int main(int argc, const char **argv)
     {
         std::cout << "CUDA is not available." << std::endl;
     }
-    std::cout << "Press enter to start";
-    std::cin.get();
     Custom custom;
     custom.Init();
 

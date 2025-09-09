@@ -37,7 +37,7 @@ double phase_policy_freq = 2;
 
 static constexpr int CALLBACK_MESSAGE_SKIP = 1; // Can be used to only process every n-th lowState message in the callback. Higher value reduces policy inference frequency
 
-static constexpr double OBS_EMA_FILTER_ALPHA = 1.0; // Filter coefficient for ema-filtering the obs
+static constexpr double OBS_EMA_FILTER_ALPHA = 0.95; // Filter coefficient for ema-filtering the obs
 
 static const int STATE_DIM = 47; // 2 for phase
 
@@ -641,7 +641,7 @@ void Custom::Init()
     InitLowCmd();
 
     // Load the neural network model
-    std::string model_path = "policies/TORQUE_styleRew_20_SEED_42/policy.pt";
+    std::string model_path = "policies/TORQUE_styleRew_25_SEED_42/policy.pt";
     if (!LoadNeuralNetwork(model_path))
     {
         std::cerr << "Failed to load neural network. Continuing without neural network inference." << std::endl;
@@ -932,7 +932,7 @@ void Custom::inputThreadFunction()
             case 'W': // Forward
                 if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
                 {
-                    cmd_x.store(cmd_x.load() + 0.1);
+                    cmd_x.store(std::min(cmd_x.load() + 0.1, 0.9));
                     std::cout << "Command: [" << std::fixed << std::setprecision(1)
                               << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
                 }
@@ -941,7 +941,7 @@ void Custom::inputThreadFunction()
             case 'S': // Backward
                 if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
                 {
-                    cmd_x.store(cmd_x.load() - 0.1);
+                    cmd_x.store(std::max(cmd_x.load() - 0.1, -0.9));
                     std::cout << "Command: [" << std::fixed << std::setprecision(1)
                               << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
                 }
@@ -950,7 +950,7 @@ void Custom::inputThreadFunction()
             case 'A': // Left
                 if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
                 {
-                    cmd_y.store(cmd_y.load() + 0.1);
+                    cmd_y.store(std::min(cmd_y.load() + 0.1, 0.2));
                     std::cout << "Command: [" << std::fixed << std::setprecision(1)
                               << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
                 }
@@ -959,7 +959,7 @@ void Custom::inputThreadFunction()
             case 'D': // Right
                 if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
                 {
-                    cmd_y.store(cmd_y.load() - 0.1);
+                    cmd_y.store(std::max(cmd_y.load() - 0.1, -0.2));
                     std::cout << "Command: [" << std::fixed << std::setprecision(1)
                               << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
                 }
@@ -968,7 +968,7 @@ void Custom::inputThreadFunction()
             case 'Q': // Rotate left
                 if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
                 {
-                    cmd_yaw.store(cmd_yaw.load() + 0.1);
+                    cmd_yaw.store(std::min(cmd_yaw.load() + 0.1, 1.4));
                     std::cout << "Command: [" << std::fixed << std::setprecision(1)
                               << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
                 }
@@ -977,7 +977,7 @@ void Custom::inputThreadFunction()
             case 'E': // Rotate right
                 if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
                 {
-                    cmd_yaw.store(cmd_yaw.load() - 0.1);
+                    cmd_yaw.store(std::max(cmd_yaw.load() - 0.1, -1.4));
                     std::cout << "Command: [" << std::fixed << std::setprecision(1)
                               << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
                 }

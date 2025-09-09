@@ -31,16 +31,18 @@ using namespace unitree::robot;
 
 /////// USER VARS
 double action_scale = 10.0;
-double clip_action_min = -23.5;
-double clip_action_max = 23.5;
+double clip_action_min = -20.0;
+double clip_action_max = 20.0;
+double phase_policy_freq = 2;
 
 static constexpr int CALLBACK_MESSAGE_SKIP = 1; // Can be used to only process every n-th lowState message in the callback. Higher value reduces policy inference frequency
 
 static constexpr double OBS_EMA_FILTER_ALPHA = 1.0; // Filter coefficient for ema-filtering the obs
 
-static const int STATE_DIM = 45;
+static const int STATE_DIM = 47; // 2 for phase
 
-enum class ControllerType : int {
+enum class ControllerType : int
+{
     DAMPING = 0,
     STAND_UP = 1,
     NEURAL_NETWORK = 2,
@@ -216,10 +218,12 @@ class Custom
 {
 public:
     Custom() {};
-    ~Custom() {
+    ~Custom()
+    {
         // Clean shutdown
         should_exit.store(true);
-        if (input_thread.joinable()) {
+        if (input_thread.joinable())
+        {
             input_thread.join();
         }
     };
@@ -259,6 +263,11 @@ private:
     void startInputThread();
     void inputThreadFunction();
 
+    // phase
+    double phase_policy = 0.0;
+    struct timespec last_inference_time;
+    bool first_inference_call = true;
+
 private:
     double stand_up_joint_pos[12] = {0.00571868, 0.608813, -1.21763, -0.00571868, 0.608813, -1.21763, 0.00571868, 0.608813, -1.21763, -0.00571868, 0.608813, -1.21763};
     double stand_down_joint_pos[12] = {0.0473455, 1.22187, -2.44375, -0.0473455, 1.22187, -2.44375, 0.0473455, 1.22187, -2.44375, -0.0473455, 1.22187, -2.44375};
@@ -280,7 +289,7 @@ private:
     ChannelSubscriberPtr<unitree_go::msg::dds_::LowState_> lowstate_subscriber;
 
     std::atomic<double> cmd_x{0.0};
-    std::atomic<double> cmd_y{0.0}; 
+    std::atomic<double> cmd_y{0.0};
     std::atomic<double> cmd_yaw{0.0};
 
     /*LowCmd write thread*/
@@ -551,9 +560,6 @@ torch::Tensor Custom::StatesToTensor(const std::map<std::string, std::vector<dou
 {
     reused_state_vector.clear();
 
-    // Direct concatenation - no string lookups
-    // Order: ang_vel_b(3) + command(3) + projected_gravity_b(3) + joint_pos(12) + joint_vel(12) + last_action(12) = 45
-
     // ang_vel_b (3 values)
     const auto &ang_vel = states.at("robot/ang_vel_b");
     reused_state_vector.insert(reused_state_vector.end(), ang_vel.begin(), ang_vel.end());
@@ -577,6 +583,10 @@ torch::Tensor Custom::StatesToTensor(const std::map<std::string, std::vector<dou
     // last_action (12 values)
     const auto &last_act = states.at("robot/last_action");
     reused_state_vector.insert(reused_state_vector.end(), last_act.begin(), last_act.end());
+
+    // phase (2 values)
+    const auto &sin_cos_phase = states.at("robot/sin_cos_phase");
+    reused_state_vector.insert(reused_state_vector.end(), sin_cos_phase.begin(), sin_cos_phase.end());
 
     // Copy data into pre-allocated tensor
     std::copy(reused_state_vector.begin(), reused_state_vector.end(),
@@ -631,7 +641,7 @@ void Custom::Init()
     InitLowCmd();
 
     // Load the neural network model
-    std::string model_path = "policies/TORQUE_complex_reward_18_SEED_42/policy.pt";
+    std::string model_path = "policies/TORQUE_styleRew_20_SEED_42/policy.pt";
     if (!LoadNeuralNetwork(model_path))
     {
         std::cerr << "Failed to load neural network. Continuing without neural network inference." << std::endl;
@@ -670,267 +680,325 @@ void Custom::InitLowCmd()
     }
 }
 
-void Custom::LowStateMessageHandler(const void *message) {
+void Custom::LowStateMessageHandler(const void *message)
+{
     static int msg_loop_counter = 0;
     msg_loop_counter++;
 
-    if (msg_loop_counter % CALLBACK_MESSAGE_SKIP != 0) {
+    if (msg_loop_counter % CALLBACK_MESSAGE_SKIP != 0)
+    {
         return;
     }
 
     low_state = *(unitree_go::msg::dds_::LowState_ *)message;
-    
+
     // Check for controller switch and handle switching
     int requested_controller = current_controller.load();
-    if (requested_controller != static_cast<int>(active_controller)) {
+    if (requested_controller != static_cast<int>(active_controller))
+    {
         active_controller = static_cast<ControllerType>(requested_controller);
         controller_switch_time = 0.0;
         position_captured = false;
+
+        if (active_controller == ControllerType::NEURAL_NETWORK)
+        {
+            phase_policy = 0.0;
+            first_inference_call = true;
+            std::cout << "Phase resetted." << std::endl;
+        }
     }
-    
+
     // Execute current controller
-    switch(active_controller) {
-        case ControllerType::DAMPING: {
-            // Set position control with damping
-            for (int i = 0; i < 12; i++) {
-                low_cmd.motor_cmd()[i].q() = 0;
-                low_cmd.motor_cmd()[i].dq() = 0;
-                low_cmd.motor_cmd()[i].kp() = 0.0;
-                low_cmd.motor_cmd()[i].kd() = 2.;
-                low_cmd.motor_cmd()[i].tau() = 0;
-            }
-            
-            low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
-            lowcmd_publisher->Write(low_cmd);
-            break;
-        }
-        
-        case ControllerType::STAND_DOWN: {
-            // Capture current position on first call
-            if (!position_captured) {
-                for (int i = 0; i < 12; i++) {
-                    switch_start_positions[i] = low_state.motor_state()[i].q();
-                }
-                position_captured = true;
-            }
-            
-            // Smooth transition to stand up position (1.2 second transition)
-            controller_switch_time += dt;
-            double phase = tanh(controller_switch_time / 1.2);
-            
-            for (int i = 0; i < 12; i++) {
-                double target_pos = phase * stand_down_joint_pos[i] + (1.0 - phase) * switch_start_positions[i];
-                
-                low_cmd.motor_cmd()[i].q() = target_pos;
-                low_cmd.motor_cmd()[i].dq() = 0;
-                low_cmd.motor_cmd()[i].kp() = 50;
-                low_cmd.motor_cmd()[i].kd() = 3.5;
-                low_cmd.motor_cmd()[i].tau() = 0;
-            }
-            
-            low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
-            lowcmd_publisher->Write(low_cmd);
-            break;
+    switch (active_controller)
+    {
+    case ControllerType::DAMPING:
+    {
+        // Set position control with damping
+        for (int i = 0; i < 12; i++)
+        {
+            low_cmd.motor_cmd()[i].q() = 0;
+            low_cmd.motor_cmd()[i].dq() = 0;
+            low_cmd.motor_cmd()[i].kp() = 0.0;
+            low_cmd.motor_cmd()[i].kd() = 2.;
+            low_cmd.motor_cmd()[i].tau() = 0;
         }
 
-        case ControllerType::STAND_UP: {
-            // Capture current position on first call
-            if (!position_captured) {
-                for (int i = 0; i < 12; i++) {
-                    switch_start_positions[i] = low_state.motor_state()[i].q();
-                }
-                position_captured = true;
-            }
-            
-            // Smooth transition to stand up position (1.2 second transition)
-            controller_switch_time += dt;
-            double phase = tanh(controller_switch_time / 1.2);
-            
-            for (int i = 0; i < 12; i++) {
-                double target_pos = phase * stand_up_joint_pos[i] + (1.0 - phase) * switch_start_positions[i];
-                
-                low_cmd.motor_cmd()[i].q() = target_pos;
-                low_cmd.motor_cmd()[i].dq() = 0;
-                low_cmd.motor_cmd()[i].kp() = phase * 50.0 + (1 - phase) * 25.0;
-                low_cmd.motor_cmd()[i].kd() = 3.5;
-                low_cmd.motor_cmd()[i].tau() = 0;
-            }
-            
-            low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
-            lowcmd_publisher->Write(low_cmd);
-            break;
-        }
-        
-        case ControllerType::NEURAL_NETWORK: {
+        low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
+        lowcmd_publisher->Write(low_cmd);
+        break;
+    }
 
-            // Your existing neural network logic
-            auto states = Go2LowStateHandler::processLowState(low_state);
-            states["robot/command"] = std::vector<double>{cmd_x.load(), cmd_y.load(), cmd_yaw.load()};
-            states["robot/last_action"] = last_action;
-            
-            torch::Tensor current_obs = StatesToTensor(states);
-            
-            if (model_loaded && obs_history_storage) {
-                obs_history_storage->add(current_obs);
-                torch::Tensor history_input = obs_history_storage->get();
-                
-                std::vector<double> actions = RunInference(history_input);
-                last_action = actions;
-                
-                if (!actions.empty()) {
-                    std::vector<double> reordered_actions(12);
-                    for (int i = 0; i < 12; ++i) {
-                        int isaac_lab_idx = JOINT_ISAAC_LAB_TO_UNITREE_MAPPING.data_ptr<int64_t>()[i];
-                        reordered_actions[i] = actions[isaac_lab_idx];
-                    }
-                    
-                    for (double &action : reordered_actions) {
-                        action = clamp(action * action_scale, clip_action_min, clip_action_max);
-                    }
-                    
-                    // Torque control mode
-                    for (int i = 0; i < 12; i++) {
-                        low_cmd.motor_cmd()[i].q() = 0;
-                        low_cmd.motor_cmd()[i].kp() = 0;
-                        low_cmd.motor_cmd()[i].dq() = 0;
-                        low_cmd.motor_cmd()[i].kd() = 0;
-                        low_cmd.motor_cmd()[i].tau() = reordered_actions[i];
-                    }
-                    
-                    cmd_timer.recordCall();
-                    
-                    low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
-                    lowcmd_publisher->Write(low_cmd);
-                }
+    case ControllerType::STAND_DOWN:
+    {
+        // Capture current position on first call
+        if (!position_captured)
+        {
+            for (int i = 0; i < 12; i++)
+            {
+                switch_start_positions[i] = low_state.motor_state()[i].q();
             }
-            break;
+            position_captured = true;
         }
+
+        // Smooth transition to stand up position (1.2 second transition)
+        controller_switch_time += dt;
+        double phase = tanh(controller_switch_time / 1.2);
+
+        for (int i = 0; i < 12; i++)
+        {
+            double target_pos = phase * stand_down_joint_pos[i] + (1.0 - phase) * switch_start_positions[i];
+
+            low_cmd.motor_cmd()[i].q() = target_pos;
+            low_cmd.motor_cmd()[i].dq() = 0;
+            low_cmd.motor_cmd()[i].kp() = 50;
+            low_cmd.motor_cmd()[i].kd() = 3.5;
+            low_cmd.motor_cmd()[i].tau() = 0;
+        }
+
+        low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
+        lowcmd_publisher->Write(low_cmd);
+        break;
+    }
+
+    case ControllerType::STAND_UP:
+    {
+        // Capture current position on first call
+        if (!position_captured)
+        {
+            for (int i = 0; i < 12; i++)
+            {
+                switch_start_positions[i] = low_state.motor_state()[i].q();
+            }
+            position_captured = true;
+        }
+
+        // Smooth transition to stand up position (1.2 second transition)
+        controller_switch_time += dt;
+        double phase = tanh(controller_switch_time / 1.2);
+
+        for (int i = 0; i < 12; i++)
+        {
+            double target_pos = phase * stand_up_joint_pos[i] + (1.0 - phase) * switch_start_positions[i];
+
+            low_cmd.motor_cmd()[i].q() = target_pos;
+            low_cmd.motor_cmd()[i].dq() = 0;
+            low_cmd.motor_cmd()[i].kp() = phase * 50.0 + (1 - phase) * 25.0;
+            low_cmd.motor_cmd()[i].kd() = 3.5;
+            low_cmd.motor_cmd()[i].tau() = 0;
+        }
+
+        low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
+        lowcmd_publisher->Write(low_cmd);
+        break;
+    }
+
+    case ControllerType::NEURAL_NETWORK:
+    {
+
+        auto states = Go2LowStateHandler::processLowState(low_state);
+
+        struct timespec current_time;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &current_time);
+        double dt_inference = 0.0;
+
+        if (first_inference_call)
+        {
+            first_inference_call = false;
+        }
+        else
+        {
+            dt_inference = ((current_time.tv_sec - last_inference_time.tv_sec)) +
+                           ((current_time.tv_nsec - last_inference_time.tv_nsec) / 1e9);
+        }
+        last_inference_time = current_time;
+
+        phase_policy += dt_inference * 2.0 * M_PI * phase_policy_freq;
+        phase_policy = fmod(phase_policy, 2.0 * M_PI); // Keep phase within [0, 2*pi]
+        states["robot/sin_cos_phase"] = {sin(phase_policy), cos(phase_policy)};
+
+        states["robot/command"] = std::vector<double>{cmd_x.load(), cmd_y.load(), cmd_yaw.load()};
+        states["robot/last_action"] = last_action;
+
+        torch::Tensor current_obs = StatesToTensor(states);
+
+        if (model_loaded && obs_history_storage)
+        {
+            obs_history_storage->add(current_obs);
+            torch::Tensor history_input = obs_history_storage->get();
+
+            std::vector<double> actions = RunInference(history_input);
+            last_action = actions;
+
+            if (!actions.empty())
+            {
+                std::vector<double> reordered_actions(12);
+                for (int i = 0; i < 12; ++i)
+                {
+                    int isaac_lab_idx = JOINT_ISAAC_LAB_TO_UNITREE_MAPPING.data_ptr<int64_t>()[i];
+                    reordered_actions[i] = actions[isaac_lab_idx];
+                }
+
+                for (double &action : reordered_actions)
+                {
+                    action = clamp(action * action_scale, clip_action_min, clip_action_max);
+                }
+
+                // Torque control mode
+                for (int i = 0; i < 12; i++)
+                {
+                    low_cmd.motor_cmd()[i].q() = 0;
+                    low_cmd.motor_cmd()[i].kp() = 0;
+                    low_cmd.motor_cmd()[i].dq() = 0;
+                    low_cmd.motor_cmd()[i].kd() = 0;
+                    low_cmd.motor_cmd()[i].tau() = reordered_actions[i];
+                }
+
+                cmd_timer.recordCall();
+
+                low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
+                lowcmd_publisher->Write(low_cmd);
+            }
+        }
+        break;
+    }
     }
 }
 
-void Custom::startInputThread() {
+void Custom::startInputThread()
+{
     input_thread = std::thread(&Custom::inputThreadFunction, this);
 }
 
-void Custom::inputThreadFunction() {
+void Custom::inputThreadFunction()
+{
     std::cout << "\nController Commands:\n";
     std::cout << "i - Idle Damping Controller\n";
-    std::cout << "u - Stand Up Controller\n"; 
-    std::cout << "l - Stand Down (Low) Controller\n"; 
+    std::cout << "u - Stand Up Controller\n";
+    std::cout << "l - Stand Down (Low) Controller\n";
     std::cout << "n - Neural Network Controller\n\n";
     std::cout << "Movement Commands (for Neural Network mode):\n";
     std::cout << "w/s - Forward/Backward (±0.1)\n";
     std::cout << "a/d - Left/Right (±0.1)\n";
     std::cout << "q/e - Rotate Left/Right (±0.1)\n";
     std::cout << "r - Reset commands to zero\n\n";
-    
+
     // Set stdin to non-blocking AND non-canonical mode
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-    
+
     struct termios old_termios, new_termios;
     tcgetattr(STDIN_FILENO, &old_termios);
     new_termios = old_termios;
     new_termios.c_lflag &= ~(ICANON | ECHO); // Disable canonical mode and echo
     tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
-    
+
     char cmd;
-    while (!should_exit.load()) {
+    while (!should_exit.load())
+    {
         // Non-blocking read
-        if (read(STDIN_FILENO, &cmd, 1) > 0) {
-            switch(cmd) {
-                // Controller switching
-                case 'i':
-                case 'I':
-                    current_controller.store(static_cast<int>(ControllerType::DAMPING));
-                    std::cout << "Switched to Idle Damping Controller\n";
-                    break;
-                case 'u':
-                case 'U':
-                    current_controller.store(static_cast<int>(ControllerType::STAND_UP));
-                    std::cout << "Switched to Stand Up Controller\n";
-                    break;
-                case 'l':
-                case 'L':
-                    current_controller.store(static_cast<int>(ControllerType::STAND_DOWN));
-                    std::cout << "Switched to Stand Down Controller\n";
-                    break;
-                case 'n':
-                case 'N':
-                    current_controller.store(static_cast<int>(ControllerType::NEURAL_NETWORK));
-                    // Reset commands when switching to Neural Network controller
-                    cmd_x.store(0.0); 
-                    cmd_y.store(0.0); 
+        if (read(STDIN_FILENO, &cmd, 1) > 0)
+        {
+            switch (cmd)
+            {
+            // Controller switching
+            case 'i':
+            case 'I':
+                current_controller.store(static_cast<int>(ControllerType::DAMPING));
+                std::cout << "Switched to Idle Damping Controller\n";
+                break;
+            case 'u':
+            case 'U':
+                current_controller.store(static_cast<int>(ControllerType::STAND_UP));
+                std::cout << "Switched to Stand Up Controller\n";
+                break;
+            case 'l':
+            case 'L':
+                current_controller.store(static_cast<int>(ControllerType::STAND_DOWN));
+                std::cout << "Switched to Stand Down Controller\n";
+                break;
+            case 'n':
+            case 'N':
+                current_controller.store(static_cast<int>(ControllerType::NEURAL_NETWORK));
+                // Reset commands when switching to Neural Network controller
+                cmd_x.store(0.0);
+                cmd_y.store(0.0);
+                cmd_yaw.store(0.0);
+                std::cout << "Switched to Neural Network Controller\n";
+                std::cout << "Commands reset to [0.0, 0.0, 0.0]\n";
+                break;
+
+            // Movement commands - ONLY work in Neural Network mode
+            case 'w':
+            case 'W': // Forward
+                if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
+                {
+                    cmd_x.store(cmd_x.load() + 0.1);
+                    std::cout << "Command: [" << std::fixed << std::setprecision(1)
+                              << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
+                }
+                break;
+            case 's':
+            case 'S': // Backward
+                if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
+                {
+                    cmd_x.store(cmd_x.load() - 0.1);
+                    std::cout << "Command: [" << std::fixed << std::setprecision(1)
+                              << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
+                }
+                break;
+            case 'a':
+            case 'A': // Left
+                if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
+                {
+                    cmd_y.store(cmd_y.load() + 0.1);
+                    std::cout << "Command: [" << std::fixed << std::setprecision(1)
+                              << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
+                }
+                break;
+            case 'd':
+            case 'D': // Right
+                if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
+                {
+                    cmd_y.store(cmd_y.load() - 0.1);
+                    std::cout << "Command: [" << std::fixed << std::setprecision(1)
+                              << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
+                }
+                break;
+            case 'q':
+            case 'Q': // Rotate left
+                if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
+                {
+                    cmd_yaw.store(cmd_yaw.load() + 0.1);
+                    std::cout << "Command: [" << std::fixed << std::setprecision(1)
+                              << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
+                }
+                break;
+            case 'e':
+            case 'E': // Rotate right
+                if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
+                {
+                    cmd_yaw.store(cmd_yaw.load() - 0.1);
+                    std::cout << "Command: [" << std::fixed << std::setprecision(1)
+                              << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
+                }
+                break;
+            case 'r':
+            case 'R': // Reset commands
+                if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
+                {
+                    cmd_x.store(0.0);
+                    cmd_y.store(0.0);
                     cmd_yaw.store(0.0);
-                    std::cout << "Switched to Neural Network Controller\n";
                     std::cout << "Commands reset to [0.0, 0.0, 0.0]\n";
-                    break;
-                    
-                // Movement commands - ONLY work in Neural Network mode
-                case 'w':
-                case 'W': // Forward
-                    if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK)) {
-                        cmd_x.store(cmd_x.load() + 0.1);
-                        std::cout << "Command: [" << std::fixed << std::setprecision(1) 
-                                  << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
-                    }
-                    break;
-                case 's':
-                case 'S': // Backward
-                    if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK)) {
-                        cmd_x.store(cmd_x.load() - 0.1);
-                        std::cout << "Command: [" << std::fixed << std::setprecision(1) 
-                                  << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
-                    }
-                    break;
-                case 'a':
-                case 'A': // Left
-                    if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK)) {
-                        cmd_y.store(cmd_y.load() + 0.1);
-                        std::cout << "Command: [" << std::fixed << std::setprecision(1) 
-                                  << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
-                    }
-                    break;
-                case 'd':
-                case 'D': // Right
-                    if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK)) {
-                        cmd_y.store(cmd_y.load() - 0.1);
-                        std::cout << "Command: [" << std::fixed << std::setprecision(1) 
-                                  << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
-                    }
-                    break;
-                case 'q':
-                case 'Q': // Rotate left
-                    if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK)) {
-                        cmd_yaw.store(cmd_yaw.load() + 0.1);
-                        std::cout << "Command: [" << std::fixed << std::setprecision(1) 
-                                  << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
-                    }
-                    break;
-                case 'e':
-                case 'E': // Rotate right
-                    if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK)) {
-                        cmd_yaw.store(cmd_yaw.load() - 0.1);
-                        std::cout << "Command: [" << std::fixed << std::setprecision(1) 
-                                  << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
-                    }
-                    break;
-                case 'r':
-                case 'R': // Reset commands
-                    if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK)) {
-                        cmd_x.store(0.0); 
-                        cmd_y.store(0.0); 
-                        cmd_yaw.store(0.0);
-                        std::cout << "Commands reset to [0.0, 0.0, 0.0]\n";
-                    }
-                    break;
+                }
+                break;
             }
         }
-        
+
         // Sleep for 100ms to reduce CPU usage
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    
+
     // Restore terminal settings
     tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
     fcntl(STDIN_FILENO, F_SETFL, flags);

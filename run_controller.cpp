@@ -30,14 +30,14 @@ using namespace unitree::common;
 using namespace unitree::robot;
 
 /////// USER VARS
-double action_scale = 10.0;
+double action_scale = 7.0;
 double clip_action_min = -20.0;
 double clip_action_max = 20.0;
 double phase_policy_freq = 2;
 
 static constexpr int CALLBACK_MESSAGE_SKIP = 1; // Can be used to only process every n-th lowState message in the callback. Higher value reduces policy inference frequency
 
-static constexpr double OBS_EMA_FILTER_ALPHA = 0.95; // Filter coefficient for ema-filtering the obs
+static constexpr double OBS_EMA_FILTER_ALPHA = 1.0; // Filter coefficient for ema-filtering the obs
 
 static const int STATE_DIM = 47; // 2 for phase
 
@@ -267,6 +267,7 @@ private:
     double phase_policy = 0.0;
     struct timespec last_inference_time;
     bool first_inference_call = true;
+
 
 private:
     double stand_up_joint_pos[12] = {0.00571868, 0.608813, -1.21763, -0.00571868, 0.608813, -1.21763, 0.00571868, 0.608813, -1.21763, -0.00571868, 0.608813, -1.21763};
@@ -641,11 +642,12 @@ void Custom::Init()
     InitLowCmd();
 
     // Load the neural network model
-    std::string model_path = "policies/TORQUE_styleRew_25_SEED_42/policy.pt";
+    std::string model_path = "policies/LatentSpaceTorque_9_SEED_4/policy.pt";
     if (!LoadNeuralNetwork(model_path))
     {
         std::cerr << "Failed to load neural network. Continuing without neural network inference." << std::endl;
     }
+
 
     /*create publisher*/
     lowcmd_publisher.reset(new ChannelPublisher<unitree_go::msg::dds_::LowCmd_>(TOPIC_LOWCMD));
@@ -671,10 +673,10 @@ void Custom::InitLowCmd()
 
     for (int i = 0; i < 20; i++)
     {
-        low_cmd.motor_cmd()[i].mode() = (0x01); // motor switch to servo (PMSM) mode
-        low_cmd.motor_cmd()[i].q() = (0);       // (PosStopF);
+        low_cmd.motor_cmd()[i].mode() = (0x01);  // motor switch to servo (PMSM) mode
+        low_cmd.motor_cmd()[i].q() = (PosStopF); // (PosStopF);
         low_cmd.motor_cmd()[i].kp() = (0);
-        low_cmd.motor_cmd()[i].dq() = (0); //(VelStopF);
+        low_cmd.motor_cmd()[i].dq() = (VelStopF); //(VelStopF);
         low_cmd.motor_cmd()[i].kd() = (0);
         low_cmd.motor_cmd()[i].tau() = (0);
     }
@@ -794,7 +796,6 @@ void Custom::LowStateMessageHandler(const void *message)
 
     case ControllerType::NEURAL_NETWORK:
     {
-
         auto states = Go2LowStateHandler::processLowState(low_state);
 
         struct timespec current_time;
@@ -813,7 +814,7 @@ void Custom::LowStateMessageHandler(const void *message)
         last_inference_time = current_time;
 
         phase_policy += dt_inference * 2.0 * M_PI * phase_policy_freq;
-        phase_policy = fmod(phase_policy, 2.0 * M_PI); // Keep phase within [0, 2*pi]
+        phase_policy = fmod(phase_policy, 2.0 * M_PI);
         states["robot/sin_cos_phase"] = {sin(phase_policy), cos(phase_policy)};
 
         states["robot/command"] = std::vector<double>{cmd_x.load(), cmd_y.load(), cmd_yaw.load()};
@@ -854,7 +855,6 @@ void Custom::LowStateMessageHandler(const void *message)
                 }
 
                 cmd_timer.recordCall();
-
                 low_cmd.crc() = crc32_core((uint32_t *)&low_cmd, (sizeof(unitree_go::msg::dds_::LowCmd_) >> 2) - 1);
                 lowcmd_publisher->Write(low_cmd);
             }
@@ -1059,6 +1059,8 @@ int main(int argc, const char **argv)
     {
         std::cout << "CUDA is not available." << std::endl;
     }
+    std::cout << "Press enter to start";
+    std::cin.get();
     Custom custom;
     custom.Init();
 

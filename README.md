@@ -16,6 +16,12 @@ This code runs in the [unitree_mujoco container]([https://github.com/Atarilab/DO
   - "--cap-add=SYS_NICE"
 
 
+## Deployment with DOOM
+- `source setup.sh` in ~/workspaces/DOOM and you are ready to go
+- TODO robot tends to fall to forward-right direction -> add more pushes to policy?
+- TOOD try smooth actions
+- TODO oscillations are still visible, especially when contact with the ground -> further penalize action changes; penalize foot contact forces; penalize non-flat orientation
+
 
 
 

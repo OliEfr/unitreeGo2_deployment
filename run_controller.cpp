@@ -1,4 +1,6 @@
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <atomic>
 #include <thread>
 #include <unistd.h>
@@ -30,16 +32,15 @@ using namespace unitree::common;
 using namespace unitree::robot;
 
 /////// USER VARS
-double action_scale = 7.0;
-double clip_action_min = -20.0;
-double clip_action_max = 20.0;
+double clip_action_min = -23.0;
+double clip_action_max = 23.0;
 double phase_policy_freq = 2;
 
 static constexpr int CALLBACK_MESSAGE_SKIP = 1; // Can be used to only process every n-th lowState message in the callback. Higher value reduces policy inference frequency
 
 static constexpr double OBS_EMA_FILTER_ALPHA = 1.0; // Filter coefficient for ema-filtering the obs
 
-static const int STATE_DIM = 47; // 2 for phase
+static const int STATE_DIM = 59; // 2 for phase, +12 for last_last_action
 
 enum class ControllerType : int
 {
@@ -268,6 +269,12 @@ private:
     struct timespec last_inference_time;
     bool first_inference_call = true;
 
+    double action_scale;
+    std::string model_path;
+    
+    bool LoadConfig(const std::string& config_file);
+    void PrintConfig();
+
 
 private:
     double stand_up_joint_pos[12] = {0.00571868, 0.608813, -1.21763, -0.00571868, 0.608813, -1.21763, 0.00571868, 0.608813, -1.21763, -0.00571868, 0.608813, -1.21763};
@@ -280,6 +287,7 @@ private:
     torch::jit::script::Module neural_network;
     bool model_loaded = false;
     std::vector<double> last_action; // Store last action for next iteration
+    std::vector<double> last_last_action; // Store last action for next iteration
 
     unitree_go::msg::dds_::LowCmd_ low_cmd{};     // default init
     unitree_go::msg::dds_::LowState_ low_state{}; // default init
@@ -466,6 +474,7 @@ public:
         states["robot/joint_pos"] = std::vector<double>(filtered_joint_pos.begin(), filtered_joint_pos.end());
         states["robot/joint_vel"] = std::vector<double>(filtered_joint_vel.begin(), filtered_joint_vel.end());
         states["robot/last_action"] = std::vector<double>(12, 0.0);
+        states["robot/last_last_action"] = std::vector<double>(12, 0.0);
         // states["robot/joint_acc"] = std::vector<double>(filtered_joint_acc.begin(), filtered_joint_acc.end());
         // states["robot/joint_tau_est"] = std::vector<double>(filtered_joint_tau.begin(), filtered_joint_tau.end());
         //  states["robot/foot_forces"] = std::vector<double>(foot_forces.begin(), foot_forces.end());
@@ -541,6 +550,7 @@ bool Custom::LoadNeuralNetwork(const std::string &model_path)
 
         // Initialize last_action with appropriate size
         last_action = std::vector<double>(12, 0.0);
+        last_last_action = std::vector<double>(12, 0.0);
 
         reused_state_vector.reserve(STATE_DIM); // Pre-allocate vector
         reused_state_tensor = torch::zeros({1, STATE_DIM}, torch::dtype(torch::kFloat32));
@@ -557,9 +567,54 @@ bool Custom::LoadNeuralNetwork(const std::string &model_path)
     }
 }
 
+bool Custom::LoadConfig(const std::string& config_file)
+{
+    std::ifstream file(config_file);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open config file: " << config_file << std::endl;
+        return false;
+    }
+    
+    std::string line;
+    bool action_scale_found = false;
+    bool model_path_found = false;
+    
+    while (std::getline(file, line)) {
+        std::istringstream iss(line);
+        std::string key, value;
+        
+        if (std::getline(iss, key, '=') && std::getline(iss, value)) {
+            if (key == "action_scale") {
+                action_scale = std::stod(value);
+                action_scale_found = true;
+            } else if (key == "model_path") {
+                model_path = value;
+                model_path_found = true;
+            }
+        }
+    }
+    
+    if (!action_scale_found || !model_path_found) {
+        std::cerr << "Error: Missing required config parameters" << std::endl;
+        return false;
+    }
+    
+    return true;
+}
+
+void Custom::PrintConfig()
+{
+    std::cout << "\n=== Loaded Configuration ===" << std::endl;
+    std::cout << "action_scale = " << action_scale << std::endl;
+    std::cout << "model_path = " << model_path << std::endl;
+    std::cout << "============================\n" << std::endl;
+}
+
 torch::Tensor Custom::StatesToTensor(const std::map<std::string, std::vector<double>> &states)
 {
     reused_state_vector.clear();
+
+    ////////// IMPORTANT: Do not forget to change STATE_DIM constant in case you change anything here //////////////
 
     // ang_vel_b (3 values)
     const auto &ang_vel = states.at("robot/ang_vel_b");
@@ -581,13 +636,19 @@ torch::Tensor Custom::StatesToTensor(const std::map<std::string, std::vector<dou
     const auto &joint_vel = states.at("robot/joint_vel");
     reused_state_vector.insert(reused_state_vector.end(), joint_vel.begin(), joint_vel.end());
 
+    // phase (2 values)
+    const auto &sin_cos_phase = states.at("robot/sin_cos_phase");
+    reused_state_vector.insert(reused_state_vector.end(), sin_cos_phase.begin(), sin_cos_phase.end());
+
+    // last_last_action (12 values)
+    const auto &last_last_act = states.at("robot/last_last_action");
+    reused_state_vector.insert(reused_state_vector.end(), last_last_act.begin(), last_last_act.end());
+
     // last_action (12 values)
     const auto &last_act = states.at("robot/last_action");
     reused_state_vector.insert(reused_state_vector.end(), last_act.begin(), last_act.end());
 
-    // phase (2 values)
-    const auto &sin_cos_phase = states.at("robot/sin_cos_phase");
-    reused_state_vector.insert(reused_state_vector.end(), sin_cos_phase.begin(), sin_cos_phase.end());
+    ////////// IMPORTANT: Do not forget to change STATE_DIM constant in case you change anything here //////////////
 
     // Copy data into pre-allocated tensor
     std::copy(reused_state_vector.begin(), reused_state_vector.end(),
@@ -641,10 +702,15 @@ void Custom::Init()
 {
     InitLowCmd();
 
+    // Load configuration
+    if (!LoadConfig("config.txt")) {
+        std::cerr << "Failed to load configuration. Exiting." << std::endl;
+        return;
+    }
+    PrintConfig();
+
     // Load the neural network model
-    std::string model_path = "policies/LatentSpaceTorque_9_SEED_4/policy.pt";
-    if (!LoadNeuralNetwork(model_path))
-    {
+    if (!LoadNeuralNetwork(model_path)) {
         std::cerr << "Failed to load neural network. Continuing without neural network inference." << std::endl;
     }
 
@@ -819,6 +885,7 @@ void Custom::LowStateMessageHandler(const void *message)
 
         states["robot/command"] = std::vector<double>{cmd_x.load(), cmd_y.load(), cmd_yaw.load()};
         states["robot/last_action"] = last_action;
+        states["robot/last_last_action"] = last_last_action;
 
         torch::Tensor current_obs = StatesToTensor(states);
 
@@ -828,6 +895,7 @@ void Custom::LowStateMessageHandler(const void *message)
             torch::Tensor history_input = obs_history_storage->get();
 
             std::vector<double> actions = RunInference(history_input);
+            last_last_action = last_action;
             last_action = actions;
 
             if (!actions.empty())
@@ -950,7 +1018,7 @@ void Custom::inputThreadFunction()
             case 'A': // Left
                 if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
                 {
-                    cmd_y.store(std::min(cmd_y.load() + 0.1, 0.2));
+                    cmd_y.store(std::min(cmd_y.load() + 0.1, 0.3));
                     std::cout << "Command: [" << std::fixed << std::setprecision(1)
                               << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
                 }
@@ -959,7 +1027,7 @@ void Custom::inputThreadFunction()
             case 'D': // Right
                 if (current_controller.load() == static_cast<int>(ControllerType::NEURAL_NETWORK))
                 {
-                    cmd_y.store(std::max(cmd_y.load() - 0.1, -0.2));
+                    cmd_y.store(std::max(cmd_y.load() - 0.1, -0.3));
                     std::cout << "Command: [" << std::fixed << std::setprecision(1)
                               << cmd_x.load() << ", " << cmd_y.load() << ", " << cmd_yaw.load() << "]\n";
                 }

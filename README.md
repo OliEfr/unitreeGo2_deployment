@@ -23,6 +23,21 @@ This code runs in the [unitree_mujoco container]([https://github.com/Atarilab/DO
 - TODO oscillations are still visible, especially when contact with the ground -> further penalize action changes; penalize foot contact forces; penalize non-flat orientation
 
 
+## NOTES
+- When I deploy in DOOM using some action delay, the robot also tends to fall to the side. maybe this can be mitigated by a) adding more action delay in sim, b) adding base_lin_vel as obs in policy
+
+
+## Results 18.09
+- TORQUE_deploy_15_SEED_42 better (much less vibrations on robot; still falls to front right in sim and real)
+- TORQUE_deploy_16_SEED_42 also good
+- TORQUE_deploy_17_SEED_42 felt like vibrations were a bit severe
+- TORQUE_deploy_18_SEED_42 best! had much less drift than the other policies! This can be used for video for sure! Maybe a bit less vibrations than 15 though, but still fine.
+- TORQUE_deploy_18_SEED_1 more drift than seed 42
+- TORQUE_deploy_18_SEED_2 better than seed 2, but worse than seed 42
+- TORQUE_deploy_19_SEED_42 not tried because seemed bad in sim
+- Overall I feel like the hips could be add more of an angle for more stable stance, but this might change torques required for hip actuators - so change this carefully!
+
+
 
 
 

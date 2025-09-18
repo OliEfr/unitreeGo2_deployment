@@ -1,4 +1,5 @@
 #include <iostream>
+#include <deque>
 #include <fstream>
 #include <sstream>
 #include <atomic>
@@ -74,6 +75,59 @@ T clamp(T value, T min_val, T max_val)
 
 // Forward declaration
 class Go2LowStateHandler;
+
+class ActionSmoother
+{
+private:
+    int queue_size;
+    std::vector<double> weights;
+    std::deque<std::vector<double>> action_queue;
+    int action_dim;
+
+public:
+    ActionSmoother(int queue_size, const std::vector<double>& weights, int action_dim = 12)
+        : queue_size(queue_size), weights(weights), action_dim(action_dim)
+    {
+        if (weights.size() != queue_size) {
+            throw std::runtime_error("Weights size must match queue size");
+        }
+        
+        // Normalize weights to sum to 1
+        double weight_sum = 0.0;
+        for (double w : weights) weight_sum += w;
+        for (double& w : this->weights) w /= weight_sum;
+    }
+
+    std::vector<double> addAndSmooth(const std::vector<double>& new_action)
+    {
+        // Add new action to queue
+        action_queue.push_back(new_action);
+        
+        // Remove oldest action if queue is full
+        if (action_queue.size() > queue_size) {
+            action_queue.pop_front();
+        }
+        
+        // If queue is not full yet, just return the new action
+        if (action_queue.size() < queue_size) {
+            return new_action;
+        }
+        
+        // Apply weighted average
+        std::vector<double> smoothed_action(action_dim, 0.0);
+        for (int i = 0; i < queue_size; ++i) {
+            for (int j = 0; j < action_dim; ++j) {
+                smoothed_action[j] += weights[i] * action_queue[i][j];
+            }
+        }
+        
+        return smoothed_action;
+    }
+    
+    void reset() {
+        action_queue.clear();
+    }
+};
 
 class ObservationHistoryStorage
 {
@@ -274,6 +328,10 @@ private:
     
     bool LoadConfig(const std::string& config_file);
     void PrintConfig();
+
+    std::unique_ptr<ActionSmoother> action_smoother;
+    int action_smoothing_queue_size = 2;
+    std::vector<double> action_smoothing_weights = {0.5, 0.5}; // Most recent gets highest weight
 
 
 private:
@@ -557,6 +615,9 @@ bool Custom::LoadNeuralNetwork(const std::string &model_path)
         tensors_initialized = true;
 
         model_loaded = true;
+
+        action_smoother = std::make_unique<ActionSmoother>(action_smoothing_queue_size, action_smoothing_weights, 12);
+
         return true;
     }
     catch (const std::exception &e)
@@ -567,6 +628,7 @@ bool Custom::LoadNeuralNetwork(const std::string &model_path)
     }
 }
 
+// 4. Modify the LoadConfig function to read smoothing parameters (replace existing LoadConfig function)
 bool Custom::LoadConfig(const std::string& config_file)
 {
     std::ifstream file(config_file);
@@ -590,6 +652,16 @@ bool Custom::LoadConfig(const std::string& config_file)
             } else if (key == "model_path") {
                 model_path = value;
                 model_path_found = true;
+            } else if (key == "action_smoothing_queue_size") {
+                action_smoothing_queue_size = std::stoi(value);
+            } else if (key == "action_smoothing_weights") {
+                // Parse comma-separated weights
+                action_smoothing_weights.clear();
+                std::stringstream ss(value);
+                std::string weight_str;
+                while (std::getline(ss, weight_str, ',')) {
+                    action_smoothing_weights.push_back(std::stod(weight_str));
+                }
             }
         }
     }
@@ -597,6 +669,16 @@ bool Custom::LoadConfig(const std::string& config_file)
     if (!action_scale_found || !model_path_found) {
         std::cerr << "Error: Missing required config parameters" << std::endl;
         return false;
+    }
+    
+    // Validate smoothing parameters
+    if (action_smoothing_weights.size() != action_smoothing_queue_size) {
+        std::cerr << "Warning: action_smoothing_weights size doesn't match queue_size. Using default weights." << std::endl;
+        action_smoothing_weights.clear();
+        double weight = 1.0 / action_smoothing_queue_size;
+        for (int i = 0; i < action_smoothing_queue_size; ++i) {
+            action_smoothing_weights.push_back(weight);
+        }
     }
     
     return true;
@@ -607,6 +689,13 @@ void Custom::PrintConfig()
     std::cout << "\n=== Loaded Configuration ===" << std::endl;
     std::cout << "action_scale = " << action_scale << std::endl;
     std::cout << "model_path = " << model_path << std::endl;
+    std::cout << "action_smoothing_queue_size = " << action_smoothing_queue_size << std::endl;
+    std::cout << "action_smoothing_weights = [";
+    for (size_t i = 0; i < action_smoothing_weights.size(); ++i) {
+        std::cout << action_smoothing_weights[i];
+        if (i < action_smoothing_weights.size() - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
     std::cout << "============================\n" << std::endl;
 }
 
@@ -773,6 +862,12 @@ void Custom::LowStateMessageHandler(const void *message)
             phase_policy = 0.0;
             first_inference_call = true;
             std::cout << "Phase resetted." << std::endl;
+
+            if (action_smoother) {
+                action_smoother->reset();
+                std::cout << "Action smoother resetted." << std::endl;
+            }
+
         }
     }
 
@@ -905,6 +1000,11 @@ void Custom::LowStateMessageHandler(const void *message)
                 {
                     int isaac_lab_idx = JOINT_ISAAC_LAB_TO_UNITREE_MAPPING.data_ptr<int64_t>()[i];
                     reordered_actions[i] = actions[isaac_lab_idx];
+                }
+
+                // Apply action smoothing
+                if (action_smoother) {
+                    reordered_actions = action_smoother->addAndSmooth(reordered_actions);
                 }
 
                 for (double &action : reordered_actions)

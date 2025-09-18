@@ -1,2 +1,4 @@
 action_scale=7.0
 model_path=policies/TORQUE_deploy_18_SEED_42/policy.pt
+action_smoothing_queue_size=1
+action_smoothing_weights=1.0
